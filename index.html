@@ -1,0 +1,731 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Potato Cannon</title>
+<style>
+  html, body {
+    margin: 0; padding: 0;
+    width: 100%; height: 100%;
+    background: #0a0e1a;
+    overflow: hidden;
+    touch-action: none;
+    -webkit-user-select: none; user-select: none;
+    -webkit-tap-highlight-color: transparent;
+    font-family: -apple-system, "Helvetica Neue", Arial, sans-serif;
+  }
+  #wrap {
+    position: fixed; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    background: #0a0e1a;
+  }
+  canvas {
+    display: block;
+    background: #87ceeb;
+    box-shadow: 0 0 40px rgba(0,0,0,0.6);
+    border-radius: 4px;
+  }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game"></canvas></div>
+<script>
+"use strict";
+/* ============================================================
+   POTATO CANNON  -  HTML5 iPad game
+   Logical space: 640 x 480 (4:3 landscape). Rendered at higher
+   pixel resolution via devicePixelRatio, scaled to fit screen.
+   ============================================================ */
+
+const W = 640, H = 480;
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+/* ---------- responsive scaling (locked 4:3 landscape) ---------- */
+let scale = 1, offX = 0, offY = 0, dpr = 1;
+function resize() {
+  dpr = Math.max(1, window.devicePixelRatio || 1);
+  const vw = window.innerWidth, vh = window.innerHeight;
+  scale = Math.min(vw / W, vh / H);
+  const cw = W * scale, ch = H * scale;
+  canvas.style.width = cw + 'px';
+  canvas.style.height = ch + 'px';
+  canvas.width = Math.round(cw * dpr);
+  canvas.height = Math.round(ch * dpr);
+  offX = (vw - cw) / 2;
+  offY = (vh - ch) / 2;
+  canvas.style.position = 'absolute';
+  canvas.style.left = offX + 'px';
+  canvas.style.top = offY + 'px';
+}
+window.addEventListener('resize', resize);
+window.addEventListener('orientationchange', resize);
+resize();
+
+/* ---------- physics constants ---------- */
+const BASE_GRAVITY = 0.7;
+const GRAVITY = BASE_GRAVITY * 0.5;
+const AIM_K = 0.11;
+const MAX_SPEED = 22;
+const POTATO_R = 7;
+
+/* ---------- world layout ---------- */
+const GROUND_Y = 440;
+const HOUSE = { x: 18, w: 74, topY: 348 };
+const PLAYER = { x: 55, y: 336 };
+const HOUSE_EDGE = HOUSE.x + HOUSE.w;
+
+/* ---------- sinusoidal ground (flat at house, wavy beyond) ---------- */
+let gAmp = 0, gFreq = 0, gSlope = 0;
+function initGround() {
+  gAmp = rand(20, 50);
+  gFreq = rand(0.5, 1.5) * 2 * Math.PI / W;
+  gSlope = rand(-0.015, 0.015);
+}
+function groundY(x) {
+  if (x <= HOUSE_EDGE) return GROUND_Y;
+  const dx = x - HOUSE_EDGE;
+  return GROUND_Y + gAmp * Math.sin(gFreq * dx) + gSlope * dx;
+}
+
+/* ---------- game state ---------- */
+const G = {
+  state: 'menu',
+  level: 1,
+  zombies: [],
+  potatoes: [],
+  features: [],
+  bonuses: [],
+  freeShots: 0,
+  tripleShots: 0,
+  wind: { dir: 0, strength: 0 },
+  aiming: false,
+  aimStart: null,
+  aimCur: null,
+  levelTimer: 0,
+  particles: [],
+  message: '',
+  messageTimer: 0,
+};
+
+/* ============================================================
+   INPUT  (touch + mouse)  ->  aim from PLAYER to release point
+   ============================================================ */
+function toLogical(clientX, clientY) {
+  const r = canvas.getBoundingClientRect();
+  return {
+    x: (clientX - r.left) / scale,
+    y: (clientY - r.top) / scale
+  };
+}
+
+function onDown(clientX, clientY) {
+  if (G.state === 'menu') { startGame(); return; }
+  if (G.state === 'gameover' || G.state === 'win') { startGame(); return; }
+  if (G.state !== 'playing') return;
+  const p = toLogical(clientX, clientY);
+  G.aiming = true;
+  G.aimStart = p;
+  G.aimCur = p;
+}
+function onMove(clientX, clientY) {
+  if (!G.aiming) return;
+  G.aimCur = toLogical(clientX, clientY);
+}
+function onUp(clientX, clientY) {
+  if (!G.aiming) return;
+  G.aiming = false;
+  const p = toLogical(clientX, clientY);
+  fireFrom(PLAYER.x, PLAYER.y, p.x, p.y);
+}
+
+canvas.addEventListener('touchstart', e => { e.preventDefault(); const t = e.changedTouches[0]; onDown(t.clientX, t.clientY); }, { passive: false });
+canvas.addEventListener('touchmove',  e => { e.preventDefault(); const t = e.changedTouches[0]; onMove(t.clientX, t.clientY); }, { passive: false });
+canvas.addEventListener('touchend',   e => { e.preventDefault(); const t = e.changedTouches[0]; onUp(t.clientX, t.clientY); }, { passive: false });
+canvas.addEventListener('mousedown', e => onDown(e.clientX, e.clientY));
+window.addEventListener('mousemove', e => onMove(e.clientX, e.clientY));
+window.addEventListener('mouseup',   e => onUp(e.clientX, e.clientY));
+
+/* ============================================================
+   SHOOTING
+   ============================================================ */
+function fireFrom(px, py, rx, ry) {
+  let dx = rx - px, dy = ry - py;
+  let len = Math.hypot(dx, dy);
+  if (len < 6) return;
+  let speed = Math.min(len * AIM_K, MAX_SPEED);
+  let vx = (dx / len) * speed;
+  let vy = (dy / len) * speed;
+
+  if (G.tripleShots > 0) {
+    G.tripleShots--;
+    const spread = 0.16;
+    launchPotato(vx, vy, -spread);
+    launchPotato(vx, vy, 0);
+    launchPotato(vx, vy, spread);
+  } else {
+    launchPotato(vx, vy, 0);
+  }
+}
+
+function launchPotato(vx, vy, angleOffset) {
+  const c = Math.cos(angleOffset), s = Math.sin(angleOffset);
+  const nvx = vx * c - vy * s;
+  const nvy = vx * s + vy * c;
+  G.potatoes.push({
+    x: PLAYER.x, y: PLAYER.y,
+    vx: nvx, vy: nvy,
+    r: POTATO_R,
+    dead: false
+  });
+}
+
+/* ============================================================
+   TERRAIN GENERATION  (random, scales with level)
+   ============================================================ */
+function rand(a, b) { return a + Math.random() * (b - a); }
+function randInt(a, b) { return Math.floor(rand(a, b + 1)); }
+
+function generateTerrain(level) {
+  G.features = [];
+  G.bonuses = [];
+  initGround();
+  G.wind.dir = Math.random() < 0.5 ? -1 : 1;
+  G.wind.strength = rand(0.02, 0.02 + level * 0.012);
+
+  const fieldL = 150, fieldR = 610;
+  const count = Math.min(3 + level, 9);
+
+  for (let i = 0; i < count; i++) {
+    const x = rand(fieldL, fieldR);
+    const wTree = 0.30 + level * 0.02;
+    const wStal = 0.20 + level * 0.02;
+    const wWind = 0.15;
+    const total = wTree + wStal + wWind;
+    let r = Math.random() * total;
+
+    if (r < wTree) {
+      const gy = groundY(x);
+      G.features.push({ type: 'tree', x: x, w: 26, topY: gy - 70, hp: 3 });
+    } else if (r < wTree + wStal) {
+      G.features.push({ type: 'stalactite', x: x, w: 22, y: 0, len: rand(70, 120), hp: 3, falling: false, vy: 0 });
+    } else {
+      const zw = rand(60, 100);
+      G.features.push({ type: 'wind', x: x - zw / 2, w: zw, y: 60, h: groundY(x) - 60, dir: Math.random() < 0.5 ? -1 : 1 });
+    }
+  }
+
+  if (Math.random() < 0.75) {
+    const types = ['nuke', 'free10', 'triple5', 'pushback'];
+    const t = types[randInt(0, types.length - 1)];
+    G.bonuses.push({ type: t, x: rand(200, 560), y: rand(90, 220), r: 18, bob: Math.random() * 6.28 });
+  }
+}
+
+/* ============================================================
+   ZOMBIES
+   ============================================================ */
+function spawnZombie(x) {
+  G.zombies.push({
+    x: x, y: groundY(x),
+    speed: (0.35 + G.level * 0.06 + rand(0, 0.15)) * 0.8 * 0.8,
+    r: 12,
+    wobble: Math.random() * 6.28,
+    dead: false
+  });
+}
+
+function spawnLevelZombies(level) {
+  G.zombies = [];
+  for (let i = 0; i < level; i++) {
+    spawnZombie(rand(430, 630));
+  }
+}
+
+/* ============================================================
+   BONUS EFFECTS
+   ============================================================ */
+function activateBonus(b) {
+  if (b.type === 'nuke') {
+    const alive = G.zombies.filter(z => !z.dead);
+    for (let i = 0; i < 3 && alive.length; i++) {
+      const idx = randInt(0, alive.length - 1);
+      const z = alive.splice(idx, 1)[0];
+      killZombie(z);
+    }
+    flash('NUKE! 3 zombies destroyed');
+  } else if (b.type === 'free10') {
+    G.freeShots += 10;
+    flash('10 FREE SHOTS (no spawn)');
+  } else if (b.type === 'triple5') {
+    G.tripleShots += 5;
+    flash('5 TRIPLE-FIRE SHOTS');
+  } else if (b.type === 'pushback') {
+    G.zombies.forEach(z => { z.x = Math.min(630, z.x + 120); });
+    flash('Zombies pushed back!');
+  }
+}
+
+function killZombie(z) {
+  z.dead = true;
+  for (let i = 0; i < 10; i++) {
+    G.particles.push({ x: z.x, y: z.y - 10, vx: rand(-2, 2), vy: rand(-3, 0), life: 30, color: '#7ec850' });
+  }
+}
+
+function flash(msg) { G.message = msg; G.messageTimer = 120; }
+
+/* ============================================================
+   UPDATE
+   ============================================================ */
+function update() {
+  if (G.state === 'levelup') {
+    G.levelTimer--;
+    if (G.levelTimer <= 0) {
+      G.level++;
+      startLevel();
+    }
+    return;
+  }
+  if (G.state !== 'playing') return;
+
+  /* ---- potatoes ---- */
+  for (const p of G.potatoes) {
+    if (p.dead) continue;
+
+    p.vx += G.wind.dir * G.wind.strength;
+
+    for (const f of G.features) {
+      if (f.type === 'wind' && p.x > f.x && p.x < f.x + f.w && p.y > f.y && p.y < f.y + f.h) {
+        p.vx += f.dir * 0.12;
+      }
+    }
+
+    p.vy += GRAVITY;
+    p.x += p.vx;
+    p.y += p.vy;
+
+    // feature collisions
+    for (const f of G.features) {
+      if (f.type === 'tree' && !f.dead &&
+          p.x > f.x - 4 && p.x < f.x + f.w + 4 && p.y > f.topY && p.y < groundY(p.x)) {
+        f.hp--;
+        p.dead = true;
+        if (f.hp <= 0) { f.dead = true; burst(p.x, p.y, '#8b5a2b'); }
+        break;
+      }
+      if (f.type === 'stalactite' && !f.falling &&
+          p.x > f.x - 4 && p.x < f.x + f.w + 4 && p.y > f.y && p.y < f.y + f.len) {
+        f.hp--;
+        p.dead = true;
+        if (f.hp <= 0) { f.falling = true; f.vy = 0; }
+        break;
+      }
+    }
+
+    // bonus collision
+    for (const b of G.bonuses) {
+      if (!b.dead && Math.hypot(p.x - b.x, p.y - b.y) < b.r + p.r) {
+        b.dead = true;
+        p.dead = true;
+        activateBonus(b);
+        break;
+      }
+    }
+
+    // zombie collision
+    for (const z of G.zombies) {
+      if (z.dead) continue;
+      if (Math.hypot(p.x - z.x, p.y - (z.y - 12)) < z.r + p.r + 4) {
+        killZombie(z);
+        p.dead = true;
+        break;
+      }
+    }
+
+    // ground / out of bounds
+    const gy = groundY(p.x);
+    if (!p.dead && (p.y >= gy || p.x < -20 || p.x > W + 20 || p.y > H + 40)) {
+      p.dead = true;
+      if (p.y >= gy && p.x > 0 && p.x < W) {
+        if (G.freeShots > 0) {
+          G.freeShots--;
+        } else {
+          spawnZombie(p.x);
+        }
+        burst(p.x, gy, '#c8a06a');
+      }
+    }
+  }
+  G.potatoes = G.potatoes.filter(p => !p.dead);
+  G.bonuses = G.bonuses.filter(b => !b.dead);
+
+  /* ---- falling stalactites ---- */
+  for (const f of G.features) {
+    if (f.type === 'stalactite' && f.falling) {
+      f.vy += GRAVITY;
+      f.y += f.vy;
+      const bottom = f.y + f.len;
+      const gy = groundY(f.x + f.w / 2);
+      for (const z of G.zombies) {
+        if (!z.dead && z.x > f.x - 6 && z.x < f.x + f.w + 6 && bottom > z.y - 24 && bottom < gy + 10) {
+          killZombie(z);
+        }
+      }
+      if (bottom >= gy) {
+        f.dead = true;
+        burst(f.x + f.w / 2, gy, '#b0b0c0');
+      }
+    }
+  }
+  G.features = G.features.filter(f => !f.dead);
+
+  /* ---- zombies ---- */
+  for (const z of G.zombies) {
+    if (z.dead) continue;
+    z.x -= z.speed;
+    z.y = groundY(z.x);
+    z.wobble += 0.15;
+    if (z.x <= HOUSE_EDGE) {
+      G.state = 'gameover';
+      return;
+    }
+  }
+  G.zombies = G.zombies.filter(z => !z.dead);
+
+  /* ---- win check ---- */
+  if (G.zombies.length === 0) {
+    if (G.level >= 10) {
+      G.state = 'win';
+    } else {
+      G.state = 'levelup';
+      G.levelTimer = 90;
+    }
+  }
+
+  /* ---- particles ---- */
+  for (const pt of G.particles) {
+    pt.x += pt.vx; pt.y += pt.vy; pt.vy += 0.15; pt.life--;
+  }
+  G.particles = G.particles.filter(pt => pt.life > 0);
+
+  if (G.messageTimer > 0) G.messageTimer--;
+}
+
+function burst(x, y, color) {
+  for (let i = 0; i < 8; i++) {
+    G.particles.push({ x, y, vx: rand(-2, 2), vy: rand(-3, 1), life: 25, color });
+  }
+}
+
+/* ============================================================
+   GAME FLOW
+   ============================================================ */
+function startGame() {
+  G.level = 1;
+  G.freeShots = 0;
+  G.tripleShots = 0;
+  startLevel();
+}
+function startLevel() {
+  G.potatoes = [];
+  G.particles = [];
+  generateTerrain(G.level);
+  spawnLevelZombies(G.level);
+  G.state = 'playing';
+  G.message = '';
+  G.messageTimer = 0;
+}
+
+/* ============================================================
+   RENDER
+   ============================================================ */
+function draw() {
+  ctx.setTransform(dpr * scale, 0, 0, dpr * scale, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+
+  drawSky();
+  drawWindIndicator();
+  drawGround();
+  drawFeatures();
+  drawHouse();
+  drawBonuses();
+  drawZombies();
+  drawPotatoes();
+  drawParticles();
+  drawAim();
+  drawHUD();
+
+  if (G.state === 'menu') drawMenu();
+  if (G.state === 'levelup') drawLevelUp();
+  if (G.state === 'gameover') drawGameOver();
+  if (G.state === 'win') drawWin();
+}
+
+function drawSky() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, '#87ceeb');
+  g.addColorStop(1, '#cfeaf5');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = 'rgba(255,240,180,0.9)';
+  ctx.beginPath(); ctx.arc(560, 70, 30, 0, 6.28); ctx.fill();
+}
+
+function drawGround() {
+  ctx.fillStyle = '#5a8f3c';
+  ctx.beginPath();
+  ctx.moveTo(0, groundY(0));
+  for (let x = 4; x <= W; x += 4) {
+    ctx.lineTo(x, groundY(x));
+  }
+  ctx.lineTo(W, H);
+  ctx.lineTo(0, H);
+  ctx.closePath();
+  ctx.fill();
+  ctx.strokeStyle = '#4a7a30';
+  ctx.lineWidth = 4;
+  ctx.beginPath();
+  ctx.moveTo(0, groundY(0));
+  for (let x = 4; x <= W; x += 4) {
+    ctx.lineTo(x, groundY(x));
+  }
+  ctx.stroke();
+}
+
+function drawHouse() {
+  ctx.fillStyle = '#b5651d';
+  ctx.fillRect(HOUSE.x, HOUSE.topY, HOUSE.w, GROUND_Y - HOUSE.topY);
+  ctx.fillStyle = '#8b2e2e';
+  ctx.beginPath();
+  ctx.moveTo(HOUSE.x - 8, HOUSE.topY);
+  ctx.lineTo(HOUSE.x + HOUSE.w / 2, HOUSE.topY - 40);
+  ctx.lineTo(HOUSE.x + HOUSE.w + 8, HOUSE.topY);
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle = '#5a3a1a';
+  ctx.fillRect(HOUSE.x + HOUSE.w / 2 - 10, GROUND_Y - 34, 20, 34);
+  ctx.fillStyle = '#bfe3ff';
+  ctx.fillRect(HOUSE.x + 10, HOUSE.topY + 14, 16, 16);
+  ctx.fillStyle = '#2b3a55';
+  ctx.beginPath(); ctx.arc(PLAYER.x, PLAYER.y + 6, 8, 0, 6.28); ctx.fill();
+  ctx.fillStyle = '#e0b088';
+  ctx.beginPath(); ctx.arc(PLAYER.x, PLAYER.y - 4, 6, 0, 6.28); ctx.fill();
+  ctx.strokeStyle = '#333'; ctx.lineWidth = 6;
+  ctx.beginPath(); ctx.moveTo(PLAYER.x, PLAYER.y + 4);
+  ctx.lineTo(PLAYER.x + 16, PLAYER.y - 6); ctx.stroke();
+}
+
+function drawFeatures() {
+  for (const f of G.features) {
+    if (f.type === 'tree') {
+      const gy = groundY(f.x + f.w / 2);
+      ctx.fillStyle = '#6b4423';
+      ctx.fillRect(f.x + f.w / 2 - 4, gy - 40, 8, 40);
+      ctx.fillStyle = '#2e7d32';
+      ctx.beginPath(); ctx.arc(f.x + f.w / 2, f.topY + 12, 20, 0, 6.28); ctx.fill();
+      ctx.beginPath(); ctx.arc(f.x + f.w / 2 - 12, f.topY + 24, 14, 0, 6.28); ctx.fill();
+      ctx.beginPath(); ctx.arc(f.x + f.w / 2 + 12, f.topY + 24, 14, 0, 6.28); ctx.fill();
+      ctx.fillStyle = '#fff';
+      for (let i = 0; i < f.hp; i++) {
+        ctx.beginPath(); ctx.arc(f.x + f.w / 2 - 8 + i * 8, f.topY - 4, 3, 0, 6.28); ctx.fill();
+      }
+    } else if (f.type === 'stalactite') {
+      ctx.fillStyle = '#9aa0b5';
+      ctx.beginPath();
+      ctx.moveTo(f.x, f.y);
+      ctx.lineTo(f.x + f.w, f.y);
+      ctx.lineTo(f.x + f.w / 2, f.y + f.len);
+      ctx.closePath(); ctx.fill();
+      if (!f.falling) {
+        ctx.fillStyle = '#fff';
+        for (let i = 0; i < f.hp; i++) {
+          ctx.beginPath(); ctx.arc(f.x + f.w / 2 - 8 + i * 8, f.y + 10, 3, 0, 6.28); ctx.fill();
+        }
+      }
+    } else if (f.type === 'wind') {
+      ctx.fillStyle = 'rgba(255,255,255,0.12)';
+      ctx.fillRect(f.x, f.y, f.w, f.h);
+      ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+      ctx.lineWidth = 2;
+      for (let i = 0; i < 3; i++) {
+        const yy = f.y + 20 + i * 30;
+        ctx.beginPath();
+        if (f.dir > 0) { ctx.moveTo(f.x + 8, yy); ctx.lineTo(f.x + f.w - 8, yy); }
+        else { ctx.moveTo(f.x + f.w - 8, yy); ctx.lineTo(f.x + 8, yy); }
+        ctx.stroke();
+      }
+    }
+  }
+}
+
+function drawBonuses() {
+  for (const b of G.bonuses) {
+    b.bob += 0.05;
+    const yy = b.y + Math.sin(b.bob) * 4;
+    const colors = { nuke: '#ff5252', free10: '#ffd54f', triple5: '#40c4ff', pushback: '#69f0ae' };
+    const icons = { nuke: '\u2622', free10: '10', triple5: '3x', pushback: '\u2194' };
+    ctx.fillStyle = colors[b.type];
+    ctx.beginPath(); ctx.arc(b.x, yy, b.r, 0, 6.28); ctx.fill();
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 14px sans-serif';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(icons[b.type], b.x, yy);
+  }
+}
+
+function drawZombies() {
+  for (const z of G.zombies) {
+    const bob = Math.sin(z.wobble) * 2;
+    ctx.fillStyle = '#5a8f3c';
+    ctx.fillRect(z.x - 8, z.y - 22 + bob, 16, 22);
+    ctx.fillStyle = '#7ec850';
+    ctx.beginPath(); ctx.arc(z.x, z.y - 28 + bob, 8, 0, 6.28); ctx.fill();
+    ctx.fillStyle = '#c00';
+    ctx.beginPath(); ctx.arc(z.x - 3, z.y - 29 + bob, 2, 0, 6.28); ctx.fill();
+    ctx.beginPath(); ctx.arc(z.x + 3, z.y - 29 + bob, 2, 0, 6.28); ctx.fill();
+    ctx.strokeStyle = '#5a8f3c'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(z.x - 8, z.y - 18 + bob); ctx.lineTo(z.x - 14, z.y - 12 + bob); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(z.x + 8, z.y - 18 + bob); ctx.lineTo(z.x + 14, z.y - 12 + bob); ctx.stroke();
+  }
+}
+
+function drawPotatoes() {
+  for (const p of G.potatoes) {
+    ctx.fillStyle = '#c8a06a';
+    ctx.beginPath(); ctx.ellipse(p.x, p.y, p.r, p.r * 0.8, 0, 0, 6.28); ctx.fill();
+    ctx.fillStyle = '#8a6a3a';
+    ctx.beginPath(); ctx.arc(p.x - 2, p.y - 1, 1.5, 0, 6.28); ctx.fill();
+    ctx.beginPath(); ctx.arc(p.x + 3, p.y + 2, 1.5, 0, 6.28); ctx.fill();
+  }
+}
+
+function drawParticles() {
+  for (const pt of G.particles) {
+    ctx.globalAlpha = Math.max(0, pt.life / 30);
+    ctx.fillStyle = pt.color;
+    ctx.fillRect(pt.x - 2, pt.y - 2, 4, 4);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawAim() {
+  if (!G.aiming || !G.aimCur) return;
+  const dx = G.aimCur.x - PLAYER.x, dy = G.aimCur.y - PLAYER.y;
+  const len = Math.hypot(dx, dy);
+  if (len < 6) return;
+  const speed = Math.min(len * AIM_K, MAX_SPEED);
+  let px = PLAYER.x, py = PLAYER.y;
+  let vx = (dx / len) * speed, vy = (dy / len) * speed;
+  ctx.fillStyle = 'rgba(255,255,255,0.6)';
+  for (let i = 0; i < 40; i++) {
+    vx += G.wind.dir * G.wind.strength;
+    vy += GRAVITY;
+    px += vx; py += vy;
+    if (py > groundY(px)) break;
+    if (i % 3 === 0) { ctx.beginPath(); ctx.arc(px, py, 2, 0, 6.28); ctx.fill(); }
+  }
+  ctx.fillStyle = 'rgba(0,0,0,0.4)';
+  ctx.fillRect(PLAYER.x - 20, PLAYER.y - 40, 40, 6);
+  ctx.fillStyle = speed > MAX_SPEED * 0.8 ? '#ff5252' : '#ffd54f';
+  ctx.fillRect(PLAYER.x - 20, PLAYER.y - 40, 40 * (speed / MAX_SPEED), 6);
+}
+
+function drawWindIndicator() {
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  ctx.fillRect(8, 8, 120, 22);
+  ctx.fillStyle = '#fff';
+  ctx.font = '12px sans-serif';
+  ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+  const arrow = G.wind.dir > 0 ? '\u2192' : '\u2190';
+  ctx.fillText('WIND ' + arrow + ' ' + Math.round(G.wind.strength * 1000), 14, 19);
+}
+
+function drawHUD() {
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  ctx.fillRect(W - 190, 8, 182, 22);
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 13px sans-serif';
+  ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+  ctx.fillText('LVL ' + G.level + '  ZOMBIES ' + G.zombies.length, W - 184, 19);
+
+  let by = 40;
+  if (G.freeShots > 0) {
+    ctx.fillStyle = 'rgba(255,213,79,0.85)';
+    ctx.fillRect(W - 190, by, 182, 20);
+    ctx.fillStyle = '#000';
+    ctx.fillText('FREE SHOTS: ' + G.freeShots, W - 184, by + 10);
+    by += 24;
+  }
+  if (G.tripleShots > 0) {
+    ctx.fillStyle = 'rgba(64,196,255,0.85)';
+    ctx.fillRect(W - 190, by, 182, 20);
+    ctx.fillStyle = '#000';
+    ctx.fillText('TRIPLE: ' + G.tripleShots, W - 184, by + 10);
+  }
+
+  if (G.messageTimer > 0) {
+    ctx.globalAlpha = Math.min(1, G.messageTimer / 40);
+    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+    ctx.fillRect(W / 2 - 160, 60, 320, 34);
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 18px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(G.message, W / 2, 77);
+    ctx.globalAlpha = 1;
+  }
+}
+
+function overlay(alpha) {
+  ctx.fillStyle = 'rgba(10,14,26,' + alpha + ')';
+  ctx.fillRect(0, 0, W, H);
+}
+function centerText(txt, y, size, color) {
+  ctx.fillStyle = color || '#fff';
+  ctx.font = 'bold ' + size + 'px sans-serif';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(txt, W / 2, y);
+}
+
+function drawMenu() {
+  overlay(0.55);
+  centerText('POTATO CANNON', 150, 44, '#ffd54f');
+  centerText('Shoot all the zombies. Do not let them reach the house!', 210, 16, '#fff');
+  centerText('Tap, drag, release to aim. Distance = power, angle = direction.', 240, 14, '#cfeaf5');
+  centerText('Hit bonus orbs for power-ups. Misses spawn zombies!', 268, 14, '#cfeaf5');
+  centerText('TAP TO START', 340, 26, '#69f0ae');
+}
+function drawLevelUp() {
+  overlay(0.5);
+  centerText('LEVEL ' + G.level + ' CLEARED!', 200, 40, '#69f0ae');
+  centerText('Get ready for level ' + (G.level + 1) + '...', 260, 20, '#fff');
+}
+function drawGameOver() {
+  overlay(0.7);
+  centerText('GAME OVER', 190, 48, '#ff5252');
+  centerText('A zombie reached the house!', 240, 18, '#fff');
+  centerText('You reached level ' + G.level, 270, 16, '#cfeaf5');
+  centerText('TAP TO RESTART', 340, 24, '#ffd54f');
+}
+function drawWin() {
+  overlay(0.7);
+  centerText('YOU WIN!', 180, 52, '#ffd54f');
+  centerText('All 10 levels cleared. The house is safe!', 240, 18, '#fff');
+  centerText('TAP TO PLAY AGAIN', 330, 24, '#69f0ae');
+}
+
+/* ============================================================
+   MAIN LOOP
+   ============================================================ */
+function loop() {
+  update();
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
